@@ -115,21 +115,3 @@ Check the diff against `docs/contributing/Style-guide-for-Flutter-repo.md` (work
 4. `SKIPPED:` what was not read or run and why (`SKIPPED: none` if nothing; the checks Gate 5 lists as *Not a signal on an open PR* are never listed here). On an `approve` with zero comments and a >200-line diff, `READ:` must name the specific files and tests that justify the approval, not just "the diff".
 
 **Comment hygiene:** no diff narration; no praise-only comments; no line numbers in prose (the anchor carries that); one comment per repeated issue, listing the other locations; no duplicates of existing threads; no restating CI beyond Gate 5's notes.
-
-## Verifying a draft (QA checklist)
-
-A wrong STOP is worse than a missed nit. Re-derive, do not trust prose.
-
-- **Gate verdict:** recompute `STOPPED_AT` from the signals above — `cla/google` state; changed paths; template-vs-body and the list of stray files; `test-exempt` label, whether the diff touches tests, and whether the exemption category genuinely applies; the `CICD` label; which checks actually failed (read the same logs and agree with the call).
-- **STOP bodies:** thank the author; state what / why / next steps; no lecturing; cite the right doc (CLA link, `CONTRIBUTING.ai.md`, Tree Hygiene › Tests, breaking-change policy); `RECOMMENDED` is one of the five values and consistent with the gate. Exception: Gate 5's no-`CICD` STOP has an empty body, and nothing from the PR head is run — not by the drafter, not by you; that is not a `SKIPPED:` item.
-- **Regression tests:** re-run the reviewer's `_reviewer_generated/issue_<id>_test.dart` and the author's test on BASE and on the PR. The FAIL-on-BASE must be for the issue's reason. Mandatory whenever the draft claims the PR does not fix the issue.
-- **Yak shave:** flag any comment that defers work to a follow-up PR or issue when it could be asked for here.
-- **Per inline comment:** claim holds for THIS code at the anchored line (not a false positive, not handled elsewhere in the diff, not contradicted by a test); bug claims backed by a re-runnable failing test; anchor inside the right hunk; not redundant with other threads, CI, or the PR body; what/why/next-steps tone; `nit:` / `style nit:` used correctly; style-guide anchors resolve in the worktree copy; footer present in the body (except on Gate 5's no-`CICD` STOP); nothing claims to be human; `RECOMMENDED` matches severity (blocking issue ⇒ not `approve`).
-- **Internal record:** `STOPPED_AT`, `RECOMMENDED`, `READ:` and `SKIPPED:` are in the `.md`, not in the body; `SKIPPED:` hides no gate signal (e.g. a failing check whose log was never read). The checks Gate 5 lists as *Not a signal on an open PR* are neither a gate signal nor a `SKIPPED:` item — not under `SKIPPED:` in the draft's `.md`, nor in your verdict below — whatever their state; neither the body nor any comment mentions them.
-- **Verdict format** — the verifier's final reply, in this order, one line per item, same labels as the internal record:
-  1. `READ:` lines: each file or hunk range, each existing thread, and `drafts/<repo>-<N>.md` — specific names, never "the diff"; each test re-run as `READ: <test> — BASE PASS|FAIL (<reason>) / PR PASS|FAIL (<reason>)`.
-  2. `SKIPPED:` lines: what was not read or re-run and why; `SKIPPED: none` if nothing.
-  3. `COVERAGE_STATUS: COMPLETE` (only with `SKIPPED: none`) or `COVERAGE_STATUS: PARTIAL — <what was not read or run, and why>`.
-  4. `VERDICT: APPROVED`, or `VERDICT: NEEDS_REVISION` followed by `GATE <n> — WRONG STOP | MISSED STOP: <evidence>` and/or `<path>:<line> — DELETE | EDIT: <why> | ADD: <missing finding>`, plus any change to `STOPPED_AT` / `RECOMMENDED`.
-
-  `PARTIAL` never accompanies `APPROVED`: a draft that could not be fully checked is `VERDICT: NEEDS_REVISION` with the gap as its first finding (`COVERAGE — <what was skipped>`). An `APPROVED` with `PARTIAL`, or with no `COVERAGE_STATUS` line, is malformed and is not an approval.
