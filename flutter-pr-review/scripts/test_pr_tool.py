@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -1080,6 +1081,224 @@ class RemoteSessionAndLuciDashboardTest(unittest.TestCase):
                 ])
             self.assertEqual(rc_diff, 0)
             self.assertIn("[R   12]", buf_diff.getvalue())
+
+    def test_extract_failure_windows_flutter_web_verbose_noise_and_megaline(self) -> None:
+        early_noise: list[str] = [
+            "[  +10 ms] executing: chromium --headless --verbosity=error",
+            "[+2040 ms] [CHROME]: error: XDG_RUNTIME_DIR not set in the environment.",
+            "[ +112 ms] [BROWSER CONSOLE] [error]: Failed to load resource: net::ERR_FAILED",
+        ]
+        for idx in range(120):
+            early_noise.append(
+                f"00:{idx % 60:02d} +{idx + 1} ~2: test/widgets/image_test.dart: "
+                f"errorBuilder - fails on load ({idx})"
+            )
+            early_noise.append(
+                f"00:{idx % 60:02d} +{idx + 1} ~2: test/widgets/image_test.dart: "
+                f"no errorBuilder - failure reported to FlutterError ({idx})"
+            )
+            early_noise.append(
+                f"00:{idx % 60:02d} +{idx + 1} ~2: test/widgets/image_test.dart: "
+                f"Failed image loads in debug mode ({idx})"
+            )
+
+        # A passing test that intentionally calls `FlutterError.dumpErrorToConsole` (`takeException()`):
+        passing_error_dump = [
+            "01:10 +400 ~10: test/widgets/error_widget_test.dart: dumps widget error cleanly",
+            "[ +120 ms] [BROWSER CONSOLE] [error]: ══╡ EXCEPTION CAUGHT BY WIDGETS LIBRARY ╞═══════════════════",
+            "           The following assertion was thrown building Builder:",
+            "           intentional test assertion",
+            "           ════════════════════════════════════════════════════════════════════════════",
+            "01:11 +401 ~10: test/widgets/error_widget_test.dart: next passing test",
+        ]
+
+        actual_failure = [
+            "01:45 +1180 ~40: test/widgets/text_selection_test.dart: dragging selection handles preserves endpoints",
+            "[+1742 ms] [BROWSER CONSOLE] [error]: ══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞════════════",
+            "           The following TestFailure was thrown running a test:",
+            "           Expected: TextSelection:<TextSelection(baseOffset: 5, extentOffset: 9)>",
+            "             Actual: TextSelection:<TextSelection(baseOffset: 4, extentOffset: 5)>",
+            "           When the exception was thrown, this was the stack:",
+            "           text_selection_test.dart 1520:5  main.<fn>",
+            "           ════════════════════════════════════════════════════════════════════════════",
+            "01:45 +1180 ~40 -1: test/widgets/text_selection_test.dart: dragging selection handles preserves endpoints [E]",
+            "  Test failed. See exception logs above.",
+            "  The test description was: dragging selection handles preserves endpoints",
+        ]
+
+        later_passing = [
+            f"02:{idx % 60:02d} +{1200 + idx} ~40 -1: test/widgets/clipboard_test.dart: Clipboard API failure ({idx})"
+            for idx in range(100)
+        ]
+
+        mega_cmd = "║ Command: ../../bin/flutter test -v --platform=chrome " + " ".join(
+            f"test/widgets/suite_{i}_test.dart" for i in range(150)
+        )
+        end_summary_and_teardown = [
+            "08:25 +7722 ~256 -1: Some tests failed.",
+            "",
+            "Failing tests:",
+            "  test/widgets/text_selection_test.dart: dragging selection handles preserves endpoints",
+            "",
+            "[  +16 ms] Shutting down Chromium.",
+            *[f"Runtime for phase Coverage_{i}: Wall-clock: 0:00:00.000000" for i in range(30)],
+            "╔═╡ERROR #1╞════════════════════════════════════════════════════════════════════",
+            mega_cmd,
+            "║ Command exited with exit code 1 but expected zero exit code.",
+            "╚═══════════════════════════════════════════════════════════════════════════════",
+            'You may find the errors by searching for "╡ERROR #" in the logs.',
+        ]
+
+        full_log = "\n".join(
+            early_noise + passing_error_dump + actual_failure + later_passing + end_summary_and_teardown
+        )
+        excerpt = pr_tool.extract_failure_windows(full_log, max_lines=80)
+        lines = excerpt.splitlines()
+
+        self.assertLessEqual(len(lines), 80)
+        self.assertTrue(all(len(ln) < 900 for ln in lines))
+        self.assertIn("EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK", excerpt)
+        self.assertIn("Expected: TextSelection:<TextSelection(baseOffset: 5, extentOffset: 9)>", excerpt)
+        self.assertIn("dragging selection handles preserves endpoints [E]", excerpt)
+        self.assertIn("Failing tests:", excerpt)
+        self.assertIn("╔═╡ERROR #1╞", excerpt)
+        self.assertIn("full line in spool dir", excerpt)
+        # Ensure benign web/test-title noise and passing `dumpErrorToConsole` banners were excluded.
+        self.assertNotIn("XDG_RUNTIME_DIR", excerpt)
+        self.assertNotIn("errorBuilder - fails on load", excerpt)
+        self.assertNotIn("Clipboard API failure", excerpt)
+        self.assertNotIn("EXCEPTION CAUGHT BY WIDGETS LIBRARY", excerpt)
+        self.assertNotIn("Shutting down Chromium", excerpt)
+
+    def test_extract_failure_windows_promotes_failing_widget_banner_and_reserves_summary_budget(self) -> None:
+        # Subcase A: `build()` throws (`EXCEPTION CAUGHT BY WIDGETS LIBRARY`) right before `[E]`,
+        # while an earlier passing test printed `EXCEPTION CAUGHT BY RENDERING LIBRARY`.
+        log_a = "\n".join([
+            *[f"00:01 +{i}: test/a_test.dart: pass {i}" for i in range(60)],
+            "00:05 +61: test/a_test.dart: expected rendering error test",
+            "══╡ EXCEPTION CAUGHT BY RENDERING LIBRARY ╞═════════════════",
+            "RenderBox was not laid out (expected in passing test)",
+            "════════════════════════════════════════════════════════════",
+            "00:06 +62: test/a_test.dart: after expected rendering error",
+            *[f"00:07 +{63 + i}: test/a_test.dart: filler {i}" for i in range(40)],
+            "00:10 +105: test/a_test.dart: widget build crashes",
+            "══╡ EXCEPTION CAUGHT BY WIDGETS LIBRARY ╞═══════════════════",
+            "The following _TypeError was thrown building MyWidget:",
+            "Null check operator used on a null value",
+            "════════════════════════════════════════════════════════════",
+            "00:10 +105 -1: test/a_test.dart: widget build crashes [E]",
+            "  Test failed. See exception logs above.",
+            *[f"00:12 +{106 + i} -1: test/a_test.dart: tail {i}" for i in range(40)],
+            "00:20 +146 -1: Some tests failed.",
+            "Failing tests:",
+            "  test/a_test.dart: widget build crashes",
+        ])
+        excerpt_a = pr_tool.extract_failure_windows(log_a, max_lines=80)
+        self.assertIn("EXCEPTION CAUGHT BY WIDGETS LIBRARY", excerpt_a)
+        self.assertIn("Null check operator used on a null value", excerpt_a)
+        self.assertIn("widget build crashes [E]", excerpt_a)
+        self.assertIn("Failing tests:", excerpt_a)
+        self.assertNotIn("EXCEPTION CAUGHT BY RENDERING LIBRARY", excerpt_a)
+
+        # Subcase B: 5 failing tests exceed `max_lines=80`, yet end-of-log `Failing tests:` is preserved.
+        blocks: list[str] = [f"00:01 +{i}: test/multi_test.dart: warmup {i}" for i in range(50)]
+        for k in range(1, 6):
+            blocks.extend([
+                f"00:1{k} +{50 + k}: test/multi_test.dart: broken case {k}",
+                "══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞════════════════════",
+                f"The following TestFailure was thrown in broken case {k}:",
+                *[f"  frame_{frame} at multi_test.dart:{100 + frame}" for frame in range(25)],
+                "════════════════════════════════════════════════════════════════════",
+                f"00:1{k} +{50 + k} -{k}: test/multi_test.dart: broken case {k} [E]",
+            ])
+        blocks.extend([f"00:30 +{100 + i} -5: test/multi_test.dart: cooldown {i}" for i in range(50)])
+        blocks.extend([
+            "00:40 +150 -5: Some tests failed.",
+            "Failing tests:",
+            *[f"  test/multi_test.dart: broken case {k}" for k in range(1, 6)],
+            "╔═╡ERROR #1╞════════════════════════════════════════════════════",
+            "║ Command exited with exit code 1.",
+            "╚═══════════════════════════════════════════════════════════════",
+        ])
+        excerpt_b = pr_tool.extract_failure_windows("\n".join(blocks), max_lines=80)
+        self.assertLessEqual(len(excerpt_b.splitlines()), 81)
+        self.assertIn("broken case 1", excerpt_b)
+        self.assertIn("EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK", excerpt_b)
+        self.assertIn("Failing tests:", excerpt_b)
+        self.assertIn("test/multi_test.dart: broken case 5", excerpt_b)
+
+    def test_tier2_gha_prefix_and_luci_noisy_stdout_fetches_stderr(self) -> None:
+        # Subcase A: `--fatal-warnings` analyzer output (Tier 2 `warning •`).
+        analyzer_log = "\n".join([
+            *[f"Analyzing package_{i}..." for i in range(80)],
+            "  warning • Unused import: 'dart:async' • lib/src/foo.dart:4:8 • unused_import",
+            *[f"Analyzing trailing_{i}..." for i in range(40)],
+        ])
+        analyzer_excerpt = pr_tool.extract_failure_windows(analyzer_log, max_lines=40)
+        self.assertIn("unused_import", analyzer_excerpt)
+
+        # Subcase B: GitHub Actions `--log-failed` tab + ISO timestamp prefix.
+        gha_prefix = "Linux Web\tRun tests\t2026-11-07T03:00:00.1234567Z "
+        gha_log = "\n".join([
+            *[f"{gha_prefix}00:05 +{i}: test/image_test.dart: errorBuilder fails ({i})" for i in range(90)],
+            f"{gha_prefix}Traceback (most recent call last):",
+            f'{gha_prefix}  File "runner.py", line 42, in <module>',
+            f"{gha_prefix}RuntimeError: shard bootstrap crashed",
+        ])
+        gha_excerpt = pr_tool.extract_failure_windows(gha_log, max_lines=40)
+        self.assertIn("Traceback (most recent call last):", gha_excerpt)
+        self.assertIn("RuntimeError: shard bootstrap crashed", gha_excerpt)
+        self.assertNotIn("errorBuilder fails (0)", gha_excerpt)
+
+        # Subcase C: `fetch_luci_build_summary` does not stop on benign `stdout` noise when real crash is on `stderr`.
+        build_payload = {
+            "id": "8666000000000000999",
+            "builder": {"builder": "Linux web_tests"},
+            "status": "FAILURE",
+            "steps": [
+                {
+                    "name": "run web shard",
+                    "status": "FAILURE",
+                    "logs": [
+                        {"name": "stdout", "viewUrl": "https://logs.chromium.org/logs/flutter/step/stdout"},
+                        {"name": "stderr", "viewUrl": "https://logs.chromium.org/logs/flutter/step/stderr"},
+                    ],
+                }
+            ],
+        }
+        benign_stdout = "\n".join([
+            "[+2040 ms] [CHROME]: error: XDG_RUNTIME_DIR not set in the environment.",
+            *[f"00:10 +{i}: test/image_test.dart: errorBuilder - fails on load ({i})" for i in range(100)],
+        ])
+        crash_stderr = "Unhandled exception:\nStateError: Chrome driver socket closed unexpectedly\n"
+
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self, _n: int = -1) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        def fake_urlopen(req_or_url: object, timeout: int = 30) -> _FakeResp:
+            url = req_or_url if isinstance(req_or_url, str) else getattr(req_or_url, "full_url", "")
+            if "cr-buildbucket.appspot.com" in url:
+                return _FakeResp((")]}'\n" + json.dumps(build_payload)).encode("utf-8"))
+            if "step/stdout" in url:
+                return _FakeResp(benign_stdout.encode("utf-8"))
+            if "step/stderr" in url:
+                return _FakeResp(crash_stderr.encode("utf-8"))
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            summary = pr_tool.fetch_luci_build_summary("8666000000000000999", max_lines=60)
+        self.assertIn("### Step `stderr`", summary)
+        self.assertIn("Chrome driver socket closed unexpectedly", summary)
 
 
 if __name__ == "__main__":

@@ -1279,6 +1279,253 @@ CI_FAILURE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GHA_LOG_PREFIX_RE = re.compile(
+    r"^[^\t\r\n]+\t[^\t\r\n]+\t\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s?"
+)
+_FLUTTER_VERBOSE_PREFIX_RE = re.compile(r"^\s*\[\s*\+?\d+\s*(?:ms|s)\]\s?")
+DART_TEST_PROGRESS_LINE_RE = re.compile(
+    r"^\s*(?:\d{2,}:)?\d{2,}:\d{2}\s+\+\d+(?:\s+~\d+)?(?:\s+-\d+)?:\s+(.*)$"
+)
+_BENIGN_CI_NOISE_RE = re.compile(
+    r"("
+    r"\[CHROME\]:\s*error:\s*XDG_RUNTIME_DIR not set|"
+    r"--verbosity=error\b|"
+    r'You may find the errors by searching for "╡ERROR #" in the logs\.'
+    r")",
+    re.IGNORECASE,
+)
+
+# Tier 1A: High-signal root-cause test, analyzer, compiler, and build failure markers.
+CI_TIER1_PRIMARY_RE = re.compile(
+    r"("
+    r"EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK|"
+    r"\[E\]\s*$|"
+    r"(?i:\bunhandled exception:)|"
+    r"^\s*Traceback \(most recent call last\):|"
+    r"(?i:\berror\s*•)|"
+    r":\d+:\d+:\s*(?i:(?:fatal\s+)?error):|"
+    r"\berror\[E\d+\]:|"
+    r"\(\d+(?:,\d+)?\):\s*(?i:(?:fatal\s+)?error)\s+[A-Z]+\d+:|"
+    r"^\s*FAILED:\s+\S|"
+    r"^\s*FAILURE:\s+Build failed with an exception\.|"
+    r"^\s*CMake Error\b"
+    r")"
+)
+
+# Tier 1B: Authoritative end-of-step Flutter/Dart test failure summaries.
+CI_TIER1_SUMMARY_RE = re.compile(
+    r"("
+    r"^\s*Failing tests:\s*$|"
+    r"\bSome tests failed\.|"
+    r"╡ERROR #\d+╞"
+    r")"
+)
+
+# Tier 2: Secondary structured failure signals (used when Tier 1A has zero matches).
+CI_TIER2_FAILURE_RE = re.compile(
+    r"("
+    r"EXCEPTION CAUGHT BY|"
+    r"The following [\w<>]+ (?:object )?was thrown|"
+    r"##\[error\]|"
+    r"(?i:\b(?:warning|info)\s*•)|"
+    r"(?i:\bfatal error:|\bld(?:\.lld)?:\s*error:|\bclang(?:\+\+)?:\s*error:|\brustc:\s*error:)|"
+    r"(?i:\b(?:process|command) exited with (?:exit )?code [1-9])|"
+    r"(?i:\binfra_failure\b|\boom-kill\b|\bTimeoutException\b|\bAssertionError\b)"
+    r")"
+)
+
+# Tier 3: Broad keyword fallback (used only when Tier 1A and Tier 2 have zero matches).
+CI_TIER3_FALLBACK_RE = re.compile(
+    r"(?i:\bFAIL(?:ED|URE)?\b|\berror\s*:|\btimed out\b)"
+)
+
+_SUMMARY_TEARDOWN_STOP_RE = re.compile(
+    r"^\s*("
+    r"Shutting down\b|"
+    r"Deleting\s+\S|"
+    r"killing pid\b|"
+    r"Runtime for phase\b|"
+    r'"flutter [^"]+" took\b|'
+    r"Reported \d+ test result|"
+    r"╔═╡ERROR #|"
+    r'You may find the errors by searching for "╡ERROR #"|'
+    r"(?:RUNNING|COMPLETED):\s"
+    r")"
+)
+
+
+def _strip_ci_line_prefix(line: str) -> str:
+    """Strip GitHub Actions `--log-failed` and `flutter -v` elapsed-time prefixes for matching."""
+    s = _GHA_LOG_PREFIX_RE.sub("", line, count=1)
+    s = _FLUTTER_VERBOSE_PREFIX_RE.sub("", s, count=1)
+    return s
+
+
+def _is_benign_ci_line(stripped_line: str) -> bool:
+    """Return True if a stripped CI log line is benign test-progress or startup noise."""
+    if _BENIGN_CI_NOISE_RE.search(stripped_line):
+        return True
+    if DART_TEST_PROGRESS_LINE_RE.match(stripped_line):
+        if re.search(r"\[E\]\s*$", stripped_line) or "Some tests failed." in stripped_line:
+            return False
+        return True
+    return False
+
+
+def has_structured_failure_marker(log_text: str) -> bool:
+    """Return True if `log_text` has at least one Tier 1 or Tier 2 failure marker."""
+    for raw_line in log_text.splitlines():
+        stripped = _strip_ci_line_prefix(raw_line)
+        if _is_benign_ci_line(stripped):
+            continue
+        if (
+            CI_TIER1_PRIMARY_RE.search(stripped)
+            or CI_TIER1_SUMMARY_RE.search(stripped)
+            or CI_TIER2_FAILURE_RE.search(stripped)
+        ):
+            return True
+    return False
+
+
+def _compute_marker_span(
+    stripped_lines: list[str],
+    idx: int,
+    *,
+    before: int,
+    after: int,
+    max_lines: int,
+) -> tuple[int, int]:
+    """Compute a tight `(start, end)` window around a matched CI marker at `idx`."""
+    n = len(stripped_lines)
+    line = stripped_lines[idx]
+
+    if re.search(r"╡ERROR #\d+╞", line):
+        s = idx
+        limit = min(n, idx + max(after, 16) + 1)
+        e = min(n, idx + min(after, 12) + 1)
+        for j in range(idx + 1, limit):
+            if stripped_lines[j].lstrip().startswith("╚═"):
+                e = j + 1
+                break
+        return (s, e)
+
+    if CI_TIER1_SUMMARY_RE.search(line):
+        s = idx
+        limit = min(n, idx + max(after, 25) + 1)
+        e = limit
+        for j in range(idx + 1, limit):
+            if _SUMMARY_TEARDOWN_STOP_RE.search(stripped_lines[j]):
+                e = j
+                break
+        while e > idx + 1 and not stripped_lines[e - 1].strip():
+            e -= 1
+        return (s, e)
+
+    if "EXCEPTION CAUGHT BY" in line.upper():
+        s = max(0, idx - min(before, 2))
+        ext_after = max(after, 32) if after >= 20 else after
+        ext_after = min(ext_after, max(8, max_lines - 6))
+        e = min(n, idx + ext_after + 1)
+        for j in range(idx + 1, e):
+            if re.match(r"^(?:\s*\[BROWSER CONSOLE\]\s*\[[a-zA-Z]+\]:)?\s*═{16,}\s*$", stripped_lines[j]):
+                e = j + 1
+                break
+        return (s, e)
+
+    if re.search(r"\[E\]\s*$", line):
+        s = max(0, idx - min(before, 2))
+        e = min(n, idx + after + 1)
+        for j in range(idx + 1, e):
+            sj = stripped_lines[j]
+            if (
+                (DART_TEST_PROGRESS_LINE_RE.match(sj) and not re.search(r"\[E\]\s*$", sj))
+                or "[BROWSER CONSOLE] [log]: Starting suite" in sj
+                or CI_TIER1_SUMMARY_RE.search(sj)
+                or _SUMMARY_TEARDOWN_STOP_RE.search(sj)
+            ):
+                e = j
+                break
+        while e > idx + 1 and not stripped_lines[e - 1].strip():
+            e -= 1
+        return (s, e)
+
+    return (max(0, idx - before), min(n, idx + after + 1))
+
+
+def _merge_spans(spans: list[tuple[int, int]], *, gap: int = 2) -> list[tuple[int, int]]:
+    """Sort and merge overlapping or near-adjacent `(start, end)` line spans."""
+    if not spans:
+        return []
+    ordered = sorted(spans, key=lambda pair: (pair[0], pair[1]))
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1] + gap:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _subtract_spans(
+    spans: list[tuple[int, int]],
+    covered: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Remove any line intervals already covered by `covered`."""
+    if not spans or not covered:
+        return list(spans)
+    result: list[tuple[int, int]] = []
+    for s, e in spans:
+        pieces = [(s, e)]
+        for cs, ce in covered:
+            next_pieces: list[tuple[int, int]] = []
+            for ps, pe in pieces:
+                if ce <= ps or cs >= pe:
+                    next_pieces.append((ps, pe))
+                else:
+                    if ps < cs:
+                        next_pieces.append((ps, cs))
+                    if pe > ce:
+                        next_pieces.append((ce, pe))
+            pieces = next_pieces
+            if not pieces:
+                break
+        result.extend(pieces)
+    return result
+
+
+def _select_spans_within_budget(
+    spans: list[tuple[int, int]],
+    budget: int,
+) -> tuple[list[tuple[int, int]], bool]:
+    """Select `(start, end)` chunks from `spans` fitting within `budget` rendered lines (including headers)."""
+    if not spans or budget <= 0:
+        return ([], bool(spans))
+    selected: list[tuple[int, int]] = []
+    used = 0
+    for s, e in spans:
+        if used + 1 >= budget:
+            return (selected, True)
+        avail = budget - (used + 1)
+        take_e = min(e, s + avail)
+        selected.append((s, take_e))
+        used += 1 + (take_e - s)
+        if take_e < e:
+            return (selected, True)
+    return (selected, False)
+
+
+MAX_CI_EXCERPT_LINE_CHARS = 800
+
+
+def _clip_ci_line(line: str, max_chars: int = MAX_CI_EXCERPT_LINE_CHARS) -> str:
+    """Bound single mega-lines (e.g. 20KB shard `Command:` lines) while preserving head and tail."""
+    if len(line) <= max_chars:
+        return line
+    head = max_chars - 200
+    tail = 120
+    omitted = len(line) - head - tail
+    return f"{line[:head]} ... [+{omitted} chars; full line in spool dir] ... {line[-tail:]}"
+
 
 def extract_failure_windows(
     log_text: str,
@@ -1292,34 +1539,95 @@ def extract_failure_windows(
     if not raw_lines:
         return "(empty log)"
     if len(raw_lines) <= max_lines:
-        return "\n".join(raw_lines)
+        return "\n".join(_clip_ci_line(ln) for ln in raw_lines)
 
-    spans: list[tuple[int, int]] = []
-    for idx, line in enumerate(raw_lines):
-        if CI_FAILURE_LINE_RE.search(line):
-            s = max(0, idx - before)
-            e = min(len(raw_lines), idx + after + 1)
-            if spans and s <= spans[-1][1] + 2:
-                spans[-1] = (spans[-1][0], max(spans[-1][1], e))
-            else:
-                spans.append((s, e))
+    stripped_lines = [_strip_ci_line_prefix(ln) for ln in raw_lines]
+    tier1_primary: set[int] = set()
+    tier1_summary: list[int] = []
+    tier2_indices: list[int] = []
+    tier3_indices: list[int] = []
 
-    if not spans:
-        tail = raw_lines[-max_lines:]
+    for idx, stripped in enumerate(stripped_lines):
+        if _is_benign_ci_line(stripped):
+            continue
+        if CI_TIER1_SUMMARY_RE.search(stripped):
+            tier1_summary.append(idx)
+            continue
+        if CI_TIER1_PRIMARY_RE.search(stripped):
+            tier1_primary.add(idx)
+            # If a Flutter test failed (`[E]`), also promote any `EXCEPTION CAUGHT BY <LIBRARY>`
+            # banner belonging to this same failing test (e.g. `WIDGETS LIBRARY` during `build()`),
+            # while ignoring banners printed by earlier passing tests (`tester.takeException()`).
+            if re.search(r"\[E\]\s*$", stripped):
+                prog_m = DART_TEST_PROGRESS_LINE_RE.match(stripped)
+                fail_label = re.sub(r"\s*\[E\]\s*$", "", prog_m.group(1)).strip() if prog_m else ""
+                for back in range(idx - 1, max(-1, idx - 250), -1):
+                    prev = stripped_lines[back]
+                    if re.search(r"\[E\]\s*$", prev):
+                        break
+                    prev_m = DART_TEST_PROGRESS_LINE_RE.match(prev)
+                    if prev_m:
+                        prev_label = prev_m.group(1).strip()
+                        if fail_label and prev_label != fail_label:
+                            break
+                    if "EXCEPTION CAUGHT BY" in prev.upper():
+                        tier1_primary.add(back)
+            continue
+        if CI_TIER2_FAILURE_RE.search(stripped):
+            tier2_indices.append(idx)
+            continue
+        if CI_TIER3_FALLBACK_RE.search(stripped):
+            tier3_indices.append(idx)
+
+    if tier1_primary:
+        chosen_primary = sorted(tier1_primary)
+    elif tier2_indices:
+        chosen_primary = tier2_indices
+    elif tier1_summary:
+        chosen_primary = []
+    else:
+        chosen_primary = tier3_indices
+
+    primary_spans = _merge_spans([
+        _compute_marker_span(stripped_lines, idx, before=before, after=after, max_lines=max_lines)
+        for idx in chosen_primary
+    ])
+    summary_spans = _merge_spans([
+        _compute_marker_span(stripped_lines, idx, before=before, after=after, max_lines=max_lines)
+        for idx in tier1_summary
+    ])
+    summary_spans = _subtract_spans(summary_spans, primary_spans)
+
+    if not primary_spans and not summary_spans:
+        tail = [_clip_ci_line(ln) for ln in raw_lines[-max_lines:]]
         return f"# No structured error marker matched; showing last {len(tail)} lines:\n" + "\n".join(tail)
 
+    total_primary_lines = sum(1 + (e - s) for s, e in primary_spans)
+    total_summary_lines = sum(1 + (e - s) for s, e in summary_spans)
+
+    if total_primary_lines + total_summary_lines <= max_lines:
+        primary_budget = total_primary_lines
+        summary_budget = total_summary_lines
+    else:
+        max_summary_reserve = min(max_lines // 2, max(16, max_lines // 3))
+        reserved_for_summary = min(total_summary_lines, max_summary_reserve) if summary_spans else 0
+        primary_budget = min(total_primary_lines, max_lines - reserved_for_summary)
+        summary_budget = max_lines - primary_budget
+
+    sel_primary, trunc_primary = _select_spans_within_budget(primary_spans, primary_budget)
+    # Reclaim any lines left unused by `sel_primary` (e.g. if the final header didn't fit).
+    actual_primary_lines = sum(1 + (e - s) for s, e in sel_primary)
+    if total_primary_lines + total_summary_lines > max_lines:
+        summary_budget = max(summary_budget, max_lines - actual_primary_lines)
+    sel_summary, trunc_summary = _select_spans_within_budget(summary_spans, summary_budget)
+
+    combined = _merge_spans(sel_primary + sel_summary, gap=0)
     out: list[str] = []
-    for s, e in spans:
-        header = f"--- [log lines {s + 1}..{e} of {len(raw_lines)}] ---"
-        if len(out) + 1 >= max_lines:
-            break
-        out.append(header)
-        remaining = max_lines - len(out)
-        chunk = raw_lines[s : min(e, s + remaining)]
-        out.extend(chunk)
-        if len(out) >= max_lines:
-            out.append(f"... [capped at {max_lines} lines; full log saved in spool dir]")
-            break
+    for s, e in combined:
+        out.append(f"--- [log lines {s + 1}..{e} of {len(raw_lines)}] ---")
+        out.extend(_clip_ci_line(ln) for ln in raw_lines[s:e])
+    if trunc_primary or trunc_summary:
+        out.append(f"... [capped at {max_lines} lines; full log saved in spool dir]")
     return "\n".join(out)
 
 
@@ -1467,7 +1775,7 @@ def fetch_luci_build_summary(
 
             if not fetched_primary:
                 fetched_primary = True
-                primary_had_marker = any(CI_FAILURE_LINE_RE.search(ln) for ln in log_text.splitlines())
+                primary_had_marker = has_structured_failure_marker(log_text)
                 parts.append(extract_failure_windows(log_text, max_lines=max_lines))
             else:
                 parts.append(
