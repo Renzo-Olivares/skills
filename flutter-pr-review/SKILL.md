@@ -31,10 +31,12 @@ Inputs to gather once: `pr view --json title,body,author,labels,isDraft,mergeabl
 
 ## Gate 2 — Right repository
 
-- **Check:** the change is not editing the framework's deprecated Material/Cupertino libraries.
-- **Signal:** changed paths under `packages/flutter/lib/src/material/**` or `packages/flutter/lib/src/cupertino/**` (or their tests) in flutter/flutter.
-- **On fail:** STOP, `RECOMMENDED: close`.
-- **Comment must say:** these libraries are deprecated in the framework; the widgets now live in `flutter/packages` as `packages/material_ui` / `packages/cupertino_ui`; please re-submit the same change there; we recommend closing this PR.
+- **Check:** the change is not editing the framework's frozen/deprecated Material or Cupertino libraries or tests.
+- **Signal:** changed paths in `flutter/flutter` under `packages/flutter/lib/src/{material,cupertino}/**`, `packages/flutter/lib/{material,cupertino}.dart`, or `packages/flutter/test/{material,cupertino}/**`.
+- **Only Material/Cupertino paths changed:** STOP, `RECOMMENDED: close`.
+  - **Comment must say:** these libraries are frozen/deprecated in `flutter/flutter` and now live in `flutter/packages` as `packages/material_ui` / `packages/cupertino_ui`; please re-submit the same change there; we recommend closing this PR.
+- **Also changes `widgets` (or other non-deprecated framework layers/tests):** STOP, `RECOMMENDED: request changes`.
+  - **Comment must say:** Material and Cupertino are frozen/deprecated in `flutter/flutter` (now `packages/material_ui` / `packages/cupertino_ui` in `flutter/packages`), while `widgets` and lower framework layers stay in `flutter/flutter`. Suggest the author first determine whether the Material/Cupertino changes are actually needed for this change (and drop them if not); if they are needed, split the PR so the `widgets`/framework changes stay in this PR and the Material/Cupertino parts go to `packages/material_ui` / `packages/cupertino_ui` in `flutter/packages`. Review resumes once the Material/Cupertino changes are removed here.
 
 ## Gate 3 — Process / AI-contribution-policy red flags
 
