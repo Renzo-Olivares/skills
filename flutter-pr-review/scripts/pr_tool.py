@@ -18,6 +18,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -173,18 +174,46 @@ def run_gh(args: list[str], *, cwd: Path | None = None, check: bool = True) -> s
     return run_cmd(["gh", *args], cwd=cwd, check=check).stdout
 
 
-def normalize_repo_slug(repo: str | None, worktree: Path | None = None) -> str:
-    """Resolve `<owner>/<repo>` from explicit flag or worktree git remote."""
+def normalize_repo_slug(
+    repo: str | None,
+    worktree: Path | None = None,
+    *,
+    pr_number: int | None = None,
+    spool_root: Path | None = None,
+) -> str:
+    """Resolve `<owner>/<repo>` from explicit flag, worktree git remote, or prior spool state."""
     if repo and "/" in repo:
         return repo.strip()
-    out = run_gh(
-        ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-        cwd=worktree,
-        check=True,
-    ).strip()
-    if not out or "/" not in out:
-        raise ToolError("Unable to infer <owner>/<repo>; pass --repo owner/repo.")
-    return out
+    cwd = worktree if (worktree is not None and worktree.is_dir()) else None
+    proc = run_cmd(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        cwd=cwd,
+        check=False,
+    )
+    out = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if out and "/" in out:
+        return out
+    if pr_number is not None:
+        root = spool_root or DEFAULT_SPOOL_ROOT
+        if root.is_dir():
+            matched_repos: set[str] = set()
+            suffix = f"-{pr_number}"
+            for child in root.iterdir():
+                if not child.is_dir() or not child.name.endswith(suffix):
+                    continue
+                st_file = child / "state.json"
+                if not st_file.is_file():
+                    continue
+                try:
+                    st = json.loads(st_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                st_repo = st.get("repo")
+                if st.get("pr_number") == pr_number and isinstance(st_repo, str) and "/" in st_repo:
+                    matched_repos.add(st_repo.strip())
+            if len(matched_repos) == 1:
+                return next(iter(matched_repos))
+    raise ToolError("Unable to infer <owner>/<repo>; pass --repo owner/repo.")
 
 
 def resolve_spool_dir(repo: str, pr_number: int, spool_root: Path | None = None) -> Path:
@@ -495,12 +524,82 @@ def extract_checklist_items(markdown_text: str) -> list[str]:
     return items
 
 
+PR_TEMPLATE_CANDIDATES = (
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/pull_request_template.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "docs/PULL_REQUEST_TEMPLATE.md",
+)
+
+
+def _worktree_matches_repo(worktree: Path, repo: str) -> bool:
+    """Return True if `worktree` is non-git or its `origin` remote matches `repo`'s name."""
+    if not (worktree / ".git").exists():
+        return True
+    proc = run_cmd(
+        ["git", "-c", "core.hooksPath=/dev/null", "remote", "get-url", "origin"],
+        cwd=worktree,
+        check=False,
+    )
+    origin = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if not origin:
+        return True
+    origin_clean = origin.rstrip("/").removesuffix(".git")
+    origin_name = origin_clean.rsplit("/", 1)[-1].rsplit(":", 1)[-1].lower()
+    target_name = repo.split("/", 1)[-1].lower()
+    return origin_name == target_name
+
+
+def resolve_pr_template(
+    repo: str,
+    worktree: Path | None,
+    *,
+    spool_dir: Path | None = None,
+    base_ref: str | None = None,
+) -> tuple[str | None, str]:
+    """Load PR template from matching local worktree, spool cache, or `gh api` fallback."""
+    if worktree and worktree.is_dir() and _worktree_matches_repo(worktree, repo):
+        for rel in PR_TEMPLATE_CANDIDATES:
+            candidate = worktree / rel
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8", errors="replace"), "worktree"
+
+    cached = (spool_dir / "PULL_REQUEST_TEMPLATE.md") if spool_dir else None
+    if cached and cached.is_file():
+        return cached.read_text(encoding="utf-8", errors="replace"), "spool"
+
+    cwd = worktree if (worktree is not None and worktree.is_dir()) else None
+    endpoints: list[str] = []
+    if base_ref:
+        quoted_ref = urllib.parse.quote(base_ref, safe="")
+        endpoints.append(f"repos/{repo}/contents/.github/PULL_REQUEST_TEMPLATE.md?ref={quoted_ref}")
+    for rel in PR_TEMPLATE_CANDIDATES:
+        ep = f"repos/{repo}/contents/{rel}"
+        if ep not in endpoints:
+            endpoints.append(ep)
+
+    for ep in endpoints:
+        proc = run_cmd(
+            ["gh", "api", ep, "-H", "Accept: application/vnd.github.raw"],
+            cwd=cwd,
+            check=False,
+        )
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            if cached:
+                cached.write_text(proc.stdout, encoding="utf-8")
+            return proc.stdout, "gh_api"
+
+    return None, "missing"
+
+
 def evaluate_gates_1_to_5(
     *,
     repo: str,
     pr_meta: dict[str, Any],
     changed_paths: list[str],
     worktree: Path | None,
+    template_text: str | None = None,
+    template_source: str | None = None,
 ) -> dict[str, Any]:
     """Deterministically compute Gate 1-5 mechanical signals from PR metadata and paths."""
     labels = [lbl.get("name", "") for lbl in (pr_meta.get("labels") or []) if isinstance(lbl, dict)]
@@ -543,26 +642,36 @@ def evaluate_gates_1_to_5(
 
     # Gate 3: PR template checklist & stray AI files
     body = pr_meta.get("body") or ""
-    has_prelaunch_heading = bool(re.search(r"^##+\s+Pre-launch Checklist", body, re.IGNORECASE | re.MULTILINE))
+    has_prelaunch_heading = bool(
+        re.search(r"^##+\s+Pre-(?:launch|Review) Checklist", body, re.IGNORECASE | re.MULTILINE)
+    )
     body_boxes = extract_checklist_items(body)
     missing_template_items: list[str] = []
     template_total = 0
-    if worktree:
-        tpl_path = worktree / ".github" / "PULL_REQUEST_TEMPLATE.md"
-        if tpl_path.is_file():
-            tpl_items = extract_checklist_items(tpl_path.read_text(encoding="utf-8", errors="replace"))
-            template_total = len(tpl_items)
-            body_lower = body.lower()
-            for t_item in tpl_items:
-                # Match using first 35 chars of normalized text so minor formatting edits still match.
-                probe = re.sub(r"\s+", " ", t_item).strip().lower()[:35]
-                if probe and probe not in re.sub(r"\s+", " ", body_lower):
-                    missing_template_items.append(t_item[:90])
+    resolved_tpl_text = template_text
+    resolved_tpl_source = template_source or "missing"
+    if resolved_tpl_text is None and worktree:
+        for rel in PR_TEMPLATE_CANDIDATES:
+            tpl_path = worktree / rel
+            if tpl_path.is_file():
+                resolved_tpl_text = tpl_path.read_text(encoding="utf-8", errors="replace")
+                resolved_tpl_source = "worktree"
+                break
+    if resolved_tpl_text is not None:
+        tpl_items = extract_checklist_items(resolved_tpl_text)
+        template_total = len(tpl_items)
+        body_norm = re.sub(r"\s+", " ", body.lower())
+        for t_item in tpl_items:
+            # Match using first 35 chars of normalized text so minor formatting edits still match.
+            probe = re.sub(r"\s+", " ", t_item).strip().lower()[:35]
+            if probe and probe not in body_norm:
+                missing_template_items.append(t_item[:90])
     stray_files = [p for p in changed_paths if is_stray_ai_path(p)]
     gate3 = {
         "has_prelaunch_checklist_heading": has_prelaunch_heading,
         "body_checkbox_count": len(body_boxes),
         "template_checkbox_count": template_total,
+        "template_source": resolved_tpl_source,
         "missing_template_items": missing_template_items,
         "stray_ai_files": stray_files,
         "note": "Also verify semantically whether PR description matches the diff (Gate 3 #2).",
@@ -963,11 +1072,13 @@ def load_spool_state(spool_dir: Path) -> dict[str, Any]:
 def cmd_preflight(args: argparse.Namespace) -> int:
     """Fetch PR artifacts once to `/tmp/...` and emit compact Gate 1-5 + diff-weight digest."""
     worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd()
-    repo = normalize_repo_slug(args.repo, worktree)
+    gh_cwd = worktree if worktree.is_dir() else None
+    spool_root = Path(args.spool_root) if args.spool_root else None
     pr_num = int(args.pr)
-    spool_dir = resolve_spool_dir(repo, pr_num, Path(args.spool_root) if args.spool_root else None)
+    repo = normalize_repo_slug(args.repo, gh_cwd, pr_number=pr_num, spool_root=spool_root)
+    spool_dir = resolve_spool_dir(repo, pr_num, spool_root)
 
-    agent_login = run_gh(["api", "user", "--jq", ".login"], cwd=worktree).strip()
+    agent_login = run_gh(["api", "user", "--jq", ".login"], cwd=gh_cwd).strip()
     pr_raw = run_gh(
         [
             "pr",
@@ -978,12 +1089,12 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             "--json",
             "number,title,body,author,labels,isDraft,mergeable,headRefOid,baseRefName,files,statusCheckRollup,url",
         ],
-        cwd=worktree,
+        cwd=gh_cwd,
     )
     (spool_dir / "pr.json").write_text(pr_raw, encoding="utf-8")
     pr_meta = json.loads(pr_raw)
 
-    diff_raw = run_gh(["pr", "diff", str(pr_num), "--repo", repo], cwd=worktree)
+    diff_raw = run_gh(["pr", "diff", str(pr_num), "--repo", repo], cwd=gh_cwd)
     (spool_dir / "diff.patch").write_text(diff_raw, encoding="utf-8")
     parsed_diff = parse_unified_diff(diff_raw)
     weights = compute_diff_weights(parsed_diff)
@@ -994,16 +1105,24 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         if isinstance(f, dict) and f.get("path")
     ] or [entry["path"] for entry in parsed_diff]
 
+    tpl_text, tpl_source = resolve_pr_template(
+        repo=repo,
+        worktree=gh_cwd,
+        spool_dir=spool_dir,
+        base_ref=pr_meta.get("baseRefName"),
+    )
     gates = evaluate_gates_1_to_5(
         repo=repo,
         pr_meta=pr_meta,
         changed_paths=changed_paths,
-        worktree=worktree if worktree.is_dir() else None,
+        worktree=gh_cwd,
+        template_text=tpl_text,
+        template_source=tpl_source,
     )
 
     # Fetch and spool threads separately (anti-anchoring: do not print threads in preflight!).
     owner, name = repo.split("/", 1)
-    gql_data = fetch_pr_threads_graphql(owner, name, pr_num, cwd=worktree)
+    gql_data = fetch_pr_threads_graphql(owner, name, pr_num, cwd=gh_cwd)
     (spool_dir / "threads_raw.json").write_text(json.dumps(gql_data, indent=2), encoding="utf-8")
     threads_md, thread_stats = format_compacted_threads(gql_data, agent_login=agent_login)
     (spool_dir / "threads.md").write_text(threads_md, encoding="utf-8")
@@ -1023,7 +1142,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
                 "--json",
                 "number,title,state,url,body,labels,comments",
             ],
-            cwd=worktree,
+            cwd=gh_cwd,
             check=False,
         )
         if proc.returncode != 0:
@@ -1091,8 +1210,10 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 def cmd_threads(args: argparse.Namespace) -> int:
     """Print compacted existing PR threads saved by `preflight`."""
     worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd()
-    repo = normalize_repo_slug(args.repo, worktree)
-    spool_dir = resolve_spool_dir(repo, int(args.pr), Path(args.spool_root) if args.spool_root else None)
+    spool_root = Path(args.spool_root) if args.spool_root else None
+    pr_num = int(args.pr)
+    repo = normalize_repo_slug(args.repo, worktree, pr_number=pr_num, spool_root=spool_root)
+    spool_dir = resolve_spool_dir(repo, pr_num, spool_root)
     threads_file = spool_dir / "threads.md"
     if not threads_file.is_file():
         raise ToolError(f"Threads file missing at {threads_file}. Run `pr_tool.py preflight` first.")
@@ -1103,8 +1224,10 @@ def cmd_threads(args: argparse.Namespace) -> int:
 def cmd_diff(args: argparse.Namespace) -> int:
     """Print right-side-annotated (`[R<line>]`) diff chunks (<=700 lines / <=35KB each)."""
     worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd()
-    repo = normalize_repo_slug(args.repo, worktree)
-    spool_dir = resolve_spool_dir(repo, int(args.pr), Path(args.spool_root) if args.spool_root else None)
+    spool_root = Path(args.spool_root) if args.spool_root else None
+    pr_num = int(args.pr)
+    repo = normalize_repo_slug(args.repo, worktree, pr_number=pr_num, spool_root=spool_root)
+    spool_dir = resolve_spool_dir(repo, pr_num, spool_root)
     diff_path = spool_dir / "diff.patch"
     if not diff_path.is_file():
         raise ToolError(f"Diff patch missing at {diff_path}. Run `pr_tool.py preflight` first.")
@@ -1200,18 +1323,34 @@ def extract_failure_windows(
     return "\n".join(out)
 
 
-def fetch_luci_build_summary(build_id: str, spool_dir: Path | None = None) -> str:
-    """Query LUCI Buildbucket v2 GetBuild PRPC endpoint and extract failing steps + logs."""
-    url = "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/GetBuild"
-    payload = json.dumps({
-        "id": build_id,
-        "mask": {
-            "fields": "id,status,summaryMarkdown,steps.name,steps.status,steps.summaryMarkdown,steps.logs"
-        },
-    }).encode("utf-8")
+LUCI_STEP_LOG_PRIORITY = (
+    "stdout",
+    "test_results",
+    "stderr",
+    "execution details",
+    "$execution details",
+)
+LUCI_MAX_RAW_LOG_BYTES = 25_000_000
+COCOON_FAILING_TASK_STATUSES = frozenset({
+    "failed",
+    "infra failure",
+    "cancelled",
+    "canceled",
+})
+MAX_DASHBOARD_DETAILED_BUILDS = 5
+
+
+def _post_buildbucket_prpc(
+    method: str,
+    payload_obj: dict[str, Any],
+    *,
+    timeout: int = 30,
+) -> tuple[str, dict[str, Any]]:
+    """POST a JSON request to LUCI Buildbucket v2 PRPC (`GetBuild`, `SearchBuilds`)."""
+    url = f"https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/{method}"
     req = urllib.request.Request(
         url,
-        data=payload,
+        data=json.dumps(payload_obj).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -1219,22 +1358,58 @@ def fetch_luci_build_summary(build_id: str, spool_dir: Path | None = None) -> st
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as exc:
-        raise ToolError(f"Failed to query LUCI Buildbucket for build {build_id}: {exc}") from exc
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        suffix = f" ({detail[:240]})" if detail else ""
+        raise ToolError(f"LUCI Buildbucket {method} failed: HTTP Error {exc.code}: {exc.reason}{suffix}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ToolError(f"LUCI Buildbucket {method} failed: {exc}") from exc
 
     if raw.startswith(")]}'"):
         raw = raw.split("\n", 1)[1] if "\n" in raw else "{}"
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"Invalid JSON from LUCI Buildbucket {method}: {exc}") from exc
+    return raw, data
+
+
+def fetch_luci_build_summary(
+    build_id: str,
+    spool_dir: Path | None = None,
+    *,
+    max_lines: int = 80,
+) -> str:
+    """Query LUCI Buildbucket v2 GetBuild PRPC endpoint and extract failing steps + logs."""
+    try:
+        raw, data = _post_buildbucket_prpc(
+            "GetBuild",
+            {
+                "id": str(build_id),
+                "mask": {"fields": "id,builder,status,summaryMarkdown,steps"},
+            },
+        )
+    except ToolError as exc:
+        raise ToolError(f"Failed to query LUCI Buildbucket for build {build_id}: {exc}") from exc
+
     if spool_dir:
         (spool_dir / f"luci_{build_id}.json").write_text(raw, encoding="utf-8")
-    data = json.loads(raw)
 
+    builder_name = ((data.get("builder") or {}).get("builder") or "").strip()
+    label = f"{build_id} ({builder_name})" if builder_name else str(build_id)
     parts: list[str] = [
-        f"# LUCI Build {build_id} — status: {data.get('status', 'UNKNOWN')}",
+        f"# LUCI Build {label} — status: {data.get('status', 'UNKNOWN')}\n"
+        f"URL: https://ci.chromium.org/b/{build_id}",
     ]
-    if data.get("summaryMarkdown"):
-        parts.append("## Build Summary\n" + data["summaryMarkdown"].strip())
+    build_summary_md = (data.get("summaryMarkdown") or "").strip()
+    if build_summary_md:
+        parts.append("## Build Summary\n" + extract_failure_windows(build_summary_md, max_lines=min(60, max_lines)))
 
     failing_steps = [
         s for s in (data.get("steps") or [])
@@ -1247,66 +1422,491 @@ def fetch_luci_build_summary(build_id: str, spool_dir: Path | None = None) -> st
         if not any(other != s.get("name", "") and other.startswith(s.get("name", "") + "|") for other in step_names)
     ] or failing_steps
 
+    priority_rank = {name: idx for idx, name in enumerate(LUCI_STEP_LOG_PRIORITY)}
     for step in leaf_steps[:5]:
         s_name = step.get("name", "?")
         s_status = step.get("status", "?")
         parts.append(f"## Failing Step: `{s_name}` ({s_status})")
-        if step.get("summaryMarkdown"):
-            parts.append(step["summaryMarkdown"].strip())
-        for log_entry in (step.get("logs") or []):
-            if log_entry.get("name") in {"stdout", "stderr", "test_results", "execution details"}:
-                view_url = log_entry.get("viewUrl") or ""
-                if view_url and "logs.chromium.org" in view_url:
-                    sep = "&" if "?" in view_url else "?"
-                    raw_url = f"{view_url}{sep}format=raw"
-                    try:
-                        with urllib.request.urlopen(raw_url, timeout=25) as lresp:
-                            log_bytes = lresp.read(2_000_000).decode("utf-8", errors="replace")
-                        if spool_dir:
-                            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", s_name)[:60]
-                            (spool_dir / f"luci_{build_id}_{safe}.log").write_text(log_bytes, encoding="utf-8")
-                        parts.append(extract_failure_windows(log_bytes, max_lines=80))
-                    except urllib.error.URLError:
-                        parts.append(f"(Could not fetch raw log: {view_url})")
-                    break
+        step_summary_md = (step.get("summaryMarkdown") or "").strip()
+        if step_summary_md and step_summary_md != build_summary_md:
+            parts.append(extract_failure_windows(step_summary_md, max_lines=min(40, max_lines)))
+
+        candidates = [
+            le for le in (step.get("logs") or [])
+            if isinstance(le, dict)
+            and le.get("name") in priority_rank
+            and "logs.chromium.org" in (le.get("viewUrl") or "")
+        ]
+        candidates.sort(key=lambda le: priority_rank[le["name"]])
+
+        fetched_primary = False
+        primary_had_marker = False
+        for log_entry in candidates:
+            log_name = str(log_entry.get("name") or "log")
+            if fetched_primary and primary_had_marker:
+                break
+            if fetched_primary and log_name != "stderr":
+                continue
+            view_url = log_entry.get("viewUrl") or ""
+            sep = "&" if "?" in view_url else "?"
+            raw_url = f"{view_url}{sep}format=raw"
+            try:
+                with urllib.request.urlopen(raw_url, timeout=30) as lresp:
+                    log_text = lresp.read(LUCI_MAX_RAW_LOG_BYTES).decode("utf-8", errors="replace")
+            except (urllib.error.URLError, TimeoutError):
+                if not fetched_primary:
+                    parts.append(f"(Could not fetch raw log: {view_url})")
+                continue
+
+            if not log_text.strip():
+                continue
+            if spool_dir:
+                safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", s_name)[:60]
+                safe_log = re.sub(r"[^A-Za-z0-9_.-]+", "_", log_name)[:20]
+                (spool_dir / f"luci_{build_id}_{safe_step}_{safe_log}.log").write_text(log_text, encoding="utf-8")
+
+            if not fetched_primary:
+                fetched_primary = True
+                primary_had_marker = any(CI_FAILURE_LINE_RE.search(ln) for ln in log_text.splitlines())
+                parts.append(extract_failure_windows(log_text, max_lines=max_lines))
+            else:
+                parts.append(
+                    f"### Step `{log_name}`\n"
+                    + extract_failure_windows(log_text, max_lines=max(20, max_lines // 2))
+                )
+                break
 
     return "\n\n".join(parts) + "\n"
 
 
+def parse_flutter_dashboard_url(target: str, default_repo: str | None = None) -> dict[str, str] | None:
+    """Parse `https://flutter-dashboard.appspot.com/#/presubmit?repo=...&sha=...` (or root URL)."""
+    try:
+        parsed = urllib.parse.urlsplit(target.strip())
+    except ValueError:
+        return None
+    host = (parsed.netloc or "").lower()
+    if host != "flutter-dashboard.appspot.com" and not host.endswith(".flutter-dashboard.appspot.com"):
+        return None
+
+    params: dict[str, list[str]] = {}
+    if parsed.query:
+        params.update(urllib.parse.parse_qs(parsed.query))
+    if "?" in (parsed.fragment or ""):
+        frag_query = parsed.fragment.split("?", 1)[1]
+        for k, v in urllib.parse.parse_qs(frag_query).items():
+            params.setdefault(k, v)
+
+    def_owner, def_name = "flutter", "flutter"
+    if default_repo and "/" in default_repo:
+        def_owner, def_name = default_repo.split("/", 1)
+
+    owner = ((params.get("owner") or [""])[0]).strip() or def_owner
+    repo_name = ((params.get("repo") or [""])[0]).strip() or def_name
+    sha = ((params.get("sha") or [""])[0]).strip()
+    return {"owner": owner, "repo": repo_name, "sha": sha}
+
+
+def search_luci_presubmit_builds_by_sha(
+    sha: str,
+    *,
+    project: str = "flutter",
+    bucket: str = "try",
+    max_pages: int = 5,
+) -> list[dict[str, Any]]:
+    """Query Buildbucket `SearchBuilds` for `sha/git/<sha>` and return latest failing builds per builder."""
+    all_builds: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(max_pages):
+        req_body: dict[str, Any] = {
+            "predicate": {
+                "builder": {"project": project, "bucket": bucket},
+                "tags": [{"key": "buildset", "value": f"sha/git/{sha}"}],
+            },
+            "pageSize": 1000,
+            "mask": {"fields": "id,builder,status,createTime,summaryMarkdown,input.properties"},
+        }
+        if page_token:
+            req_body["pageToken"] = page_token
+        _, res = _post_buildbucket_prpc("SearchBuilds", req_body)
+        all_builds.extend(b for b in (res.get("builds") or []) if isinstance(b, dict))
+        page_token = str(res.get("nextPageToken") or "")
+        if not page_token:
+            break
+
+    by_builder: dict[str, list[dict[str, Any]]] = {}
+    for b in all_builds:
+        bname = ((b.get("builder") or {}).get("builder") or "").strip()
+        if bname:
+            by_builder.setdefault(bname, []).append(b)
+
+    failing: list[dict[str, Any]] = []
+    for bname in sorted(by_builder):
+        attempts = by_builder[bname]
+        attempts.sort(
+            key=lambda item: (
+                str(item.get("createTime") or ""),
+                int(item["id"]) if str(item.get("id", "")).isdigit() else 0,
+            ),
+            reverse=True,
+        )
+        latest = attempts[0]
+        props = ((latest.get("input") or {}).get("properties") or {})
+        if props.get("bringup") is True:
+            continue
+        status = str(latest.get("status") or "").upper()
+        if status in {"FAILURE", "INFRA_FAILURE", "CANCELED"}:
+            failing.append({
+                "stage": "try",
+                "job_name": bname,
+                "status": status,
+                "build_id": str(latest.get("id") or "").strip(),
+                "attempt_number": len(attempts),
+                "total_attempts": len(attempts),
+                "summary": str(latest.get("summaryMarkdown") or "").strip(),
+            })
+    return failing
+
+
+def _fetch_cocoon_json(url: str, *, timeout: int = 20) -> Any:
+    """GET JSON from `flutter-dashboard.appspot.com/api/public/...`."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return raw, json.loads(raw)
+
+
+def fetch_flutter_dashboard_presubmit_summary(
+    owner: str,
+    repo_name: str,
+    sha: str,
+    spool_dir: Path | None = None,
+    *,
+    max_lines: int = 120,
+) -> str:
+    """Resolve Flutter's consolidated `Dashboard Checks` URL into failing LUCI job logs."""
+    failing_entries: list[dict[str, Any]] = []
+    counts_note = ""
+    guard_ok = False
+    guard_err: Exception | None = None
+
+    guard_qs = urllib.parse.urlencode({"owner": owner, "repo": repo_name, "sha": sha})
+    guard_url = f"https://flutter-dashboard.appspot.com/api/public/get-presubmit-guard?{guard_qs}"
+    try:
+        guard_raw, guard_data = _fetch_cocoon_json(guard_url, timeout=20)
+        if isinstance(guard_data, dict):
+            guard_ok = True
+            if spool_dir:
+                (spool_dir / f"dashboard_guard_{sha[:12]}.json").write_text(guard_raw, encoding="utf-8")
+            check_run_id = guard_data.get("check_run_id")
+            succeeded = 0
+            in_progress = 0
+            neutral = 0
+            for st in (guard_data.get("stages") or []):
+                if not isinstance(st, dict):
+                    continue
+                st_name = str(st.get("name") or "default")
+                for job_name, raw_status in (st.get("jobs") or {}).items():
+                    s_val = str(raw_status or "").strip()
+                    s_low = s_val.lower()
+                    if s_low in COCOON_FAILING_TASK_STATUSES:
+                        failing_entries.append({
+                            "stage": st_name,
+                            "job_name": str(job_name),
+                            "status": s_val,
+                            "build_id": "",
+                            "attempt_number": 0,
+                            "total_attempts": 0,
+                            "summary": "",
+                        })
+                    elif s_low == "succeeded":
+                        succeeded += 1
+                    elif s_low in {"in progress", "new"}:
+                        in_progress += 1
+                    else:
+                        neutral += 1
+            counts_note = (
+                f", {succeeded} succeeded, {in_progress} in progress, {neutral} neutral/skipped"
+            )
+
+            if check_run_id and failing_entries:
+                def _load_job(entry: dict[str, Any]) -> None:
+                    j_qs = urllib.parse.urlencode({
+                        "check_run_id": str(check_run_id),
+                        "job_name": entry["job_name"],
+                        "repo": repo_name,
+                        "owner": owner,
+                    })
+                    j_url = f"https://flutter-dashboard.appspot.com/api/public/get-presubmit-job?{j_qs}"
+                    try:
+                        _, attempts = _fetch_cocoon_json(j_url, timeout=15)
+                    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+                        return
+                    if isinstance(attempts, list) and attempts:
+                        valid = [a for a in attempts if isinstance(a, dict)]
+                        if not valid:
+                            return
+                        valid.sort(
+                            key=lambda a: (
+                                int(a.get("attempt_number") or 0),
+                                int(a.get("creation_time") or 0),
+                            ),
+                            reverse=True,
+                        )
+                        latest = valid[0]
+                        entry["build_id"] = str(latest.get("build_id") or "").strip()
+                        entry["attempt_number"] = int(latest.get("attempt_number") or len(valid))
+                        entry["total_attempts"] = len(valid)
+                        entry["summary"] = str(latest.get("summary") or "").strip()
+
+                if len(failing_entries) == 1:
+                    _load_job(failing_entries[0])
+                else:
+                    with ThreadPoolExecutor(max_workers=min(4, len(failing_entries))) as pool:
+                        list(pool.map(_load_job, failing_entries))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        guard_err = exc
+
+    # Fallback to Buildbucket SearchBuilds if Cocoon guard failed or any failing job lacks a build_id.
+    if (not guard_ok) or any(not e.get("build_id") for e in failing_entries):
+        try:
+            bb_failing = search_luci_presubmit_builds_by_sha(sha, project=owner)
+        except ToolError as bb_exc:
+            if not guard_ok:
+                raise ToolError(
+                    f"Failed to resolve Flutter Dashboard presubmit for {owner}/{repo_name}@{sha}: "
+                    f"dashboard error ({guard_err}); Buildbucket fallback error ({bb_exc})"
+                ) from bb_exc
+            bb_failing = []
+
+        if not guard_ok:
+            failing_entries = bb_failing
+        else:
+            by_name = {b["job_name"]: b for b in bb_failing}
+            for entry in failing_entries:
+                if not entry.get("build_id") and entry["job_name"] in by_name:
+                    fb = by_name[entry["job_name"]]
+                    entry["build_id"] = fb["build_id"]
+                    entry["attempt_number"] = entry["attempt_number"] or fb["attempt_number"]
+                    entry["total_attempts"] = entry["total_attempts"] or fb["total_attempts"]
+                    if not entry.get("summary"):
+                        entry["summary"] = fb["summary"]
+
+    header = (
+        f"# Flutter Dashboard Presubmit (`{owner}/{repo_name}` @ `{sha[:12]}`) — "
+        f"{len(failing_entries)} failing job(s){counts_note}"
+    )
+    if not failing_entries:
+        return header + "\n\nNo failing presubmit jobs found for this commit.\n"
+
+    lines: list[str] = [header, "## Failing Presubmit Jobs"]
+    job_list: list[str] = []
+    for entry in failing_entries:
+        att = (
+            f", attempt {entry['attempt_number']}/{entry['total_attempts']}"
+            if entry.get("total_attempts")
+            else ""
+        )
+        b_url = f" — https://ci.chromium.org/b/{entry['build_id']}" if entry.get("build_id") else ""
+        job_list.append(f"- `{entry['job_name']}` ({entry['status']}{att}){b_url}")
+    lines.append("\n".join(job_list))
+
+    detailed = failing_entries[:MAX_DASHBOARD_DETAILED_BUILDS]
+    overflow = failing_entries[MAX_DASHBOARD_DETAILED_BUILDS:]
+    per_build_lines = max_lines if len(detailed) == 1 else max(45, min(80, max_lines))
+
+    def _render_detailed(entry: dict[str, Any]) -> str:
+        bid = entry.get("build_id") or ""
+        if bid:
+            try:
+                return fetch_luci_build_summary(bid, spool_dir, max_lines=per_build_lines).rstrip()
+            except ToolError as exc:
+                fallback = extract_failure_windows(entry.get("summary") or "", max_lines=40)
+                return f"# Job `{entry['job_name']}` (build {bid} lookup error: {exc})\n\n{fallback}"
+        fallback = extract_failure_windows(entry.get("summary") or "(no summary available)", max_lines=40)
+        return f"# Job `{entry['job_name']}` ({entry['status']})\n\n{fallback}"
+
+    if len(detailed) == 1:
+        lines.append(_render_detailed(detailed[0]))
+    else:
+        with ThreadPoolExecutor(max_workers=min(4, len(detailed))) as pool:
+            lines.extend(pool.map(_render_detailed, detailed))
+
+    if overflow:
+        extra_blocks = [
+            f"## Additional Failing Jobs ({len(overflow)} more; pass build URL to `pr_tool.py ci-log` for full step logs)"
+        ]
+        for entry in overflow:
+            b_ref = f"https://ci.chromium.org/b/{entry['build_id']}" if entry.get("build_id") else "no build_id"
+            extra_blocks.append(f"### `{entry['job_name']}` ({b_ref})")
+            if entry.get("summary"):
+                extra_blocks.append(extract_failure_windows(entry["summary"], max_lines=15))
+        lines.append("\n\n".join(extra_blocks))
+
+    return "\n\n".join(lines) + "\n"
+
+
+def _resolve_head_sha_for_ci(
+    repo: str | None,
+    pr_num: int | None,
+    spool_dir: Path,
+    gh_cwd: Path | None,
+) -> str | None:
+    """Resolve PR HEAD SHA from spooled `state.json` or `gh pr view` when needed."""
+    st_file = spool_dir / "state.json"
+    if st_file.is_file():
+        try:
+            st = json.loads(st_file.read_text(encoding="utf-8"))
+            sha = str(st.get("head_sha") or "").strip()
+            if sha:
+                return sha
+        except (OSError, json.JSONDecodeError):
+            pass
+    if repo and pr_num is not None:
+        out = run_gh(
+            ["pr", "view", str(pr_num), "--repo", repo, "--json", "headRefOid", "--jq", ".headRefOid"],
+            cwd=gh_cwd,
+            check=False,
+        ).strip()
+        if out:
+            return out
+    return None
+
+
 def cmd_ci_log(args: argparse.Namespace) -> int:
-    """Fetch GitHub Actions `--log-failed` or LUCI Buildbucket build failure windows."""
+    """Fetch GitHub Actions `--log-failed`, Flutter Dashboard Presubmit, or LUCI Buildbucket failure windows."""
     worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd()
-    repo = normalize_repo_slug(args.repo, worktree) if (args.repo or args.pr) else None
+    gh_cwd = worktree if worktree.is_dir() else None
+    spool_root = Path(args.spool_root) if args.spool_root else None
+    pr_num = int(args.pr) if args.pr is not None else None
+
+    repo: str | None = None
+    if args.repo or pr_num is not None:
+        try:
+            repo = normalize_repo_slug(args.repo, gh_cwd, pr_number=pr_num, spool_root=spool_root)
+        except ToolError:
+            repo = None
+
     spool_dir = (
-        resolve_spool_dir(repo, int(args.pr), Path(args.spool_root) if args.spool_root else None)
-        if (repo and args.pr)
-        else DEFAULT_SPOOL_ROOT
+        resolve_spool_dir(repo, pr_num, spool_root)
+        if (repo and pr_num is not None)
+        else (spool_root or DEFAULT_SPOOL_ROOT)
     )
     spool_dir.mkdir(parents=True, exist_ok=True)
     target = args.target.strip()
 
-    # Case 1: LUCI URL or 16+ digit Buildbucket ID
-    luci_m = re.search(r"(?:/b/|/b)(\d{15,})\b", target) or re.match(r"^(\d{16,})$", target)
+    # Case 1: LUCI Buildbucket URL (`/b/<id>`, `/b<id>`, `/build/<id>`) or 16+ digit build ID
+    luci_m = re.search(r"(?:/b/|/b|/build/)(\d{15,})\b", target) or re.match(r"^(\d{16,})$", target)
     if luci_m:
-        sys.stdout.write(fetch_luci_build_summary(luci_m.group(1), spool_dir))
+        sys.stdout.write(fetch_luci_build_summary(luci_m.group(1), spool_dir, max_lines=args.max_lines))
         return 0
 
-    # Case 2: GitHub Actions run URL or numeric run_id
-    gh_m = re.search(r"/actions/runs/(\d+)", target) or re.match(r"^(\d+)$", target)
-    if gh_m:
-        run_id = gh_m.group(1)
+    # Case 2: Flutter consolidated Dashboard URL (`https://flutter-dashboard.appspot.com/#/presubmit?repo=...&sha=...`)
+    dash = parse_flutter_dashboard_url(target, default_repo=repo)
+    if dash is not None:
+        owner = dash["owner"]
+        repo_name = dash["repo"]
+        sha = dash["sha"]
+        if not sha:
+            full_repo = repo or f"{owner}/{repo_name}"
+            sha = _resolve_head_sha_for_ci(full_repo, pr_num, spool_dir, gh_cwd) or ""
+            if not sha:
+                raise ToolError(
+                    "Flutter Dashboard URL has no `sha=` parameter; pass `--pr <N> --repo <owner/repo>` "
+                    "or use the `#/presubmit?repo=...&sha=<sha>` URL."
+                )
+            # Check GitHub check-runs first in case a non-LUCI dashboard check (e.g. `ci.yaml validation`) failed.
+            cr_proc = run_cmd(
+                ["gh", "api", f"repos/{full_repo}/commits/{sha}/check-runs"],
+                cwd=gh_cwd,
+                check=False,
+            )
+            printed_check_output = False
+            need_presubmit = False
+            if cr_proc.returncode == 0 and cr_proc.stdout.strip():
+                try:
+                    cr_data = json.loads(cr_proc.stdout)
+                    for cr in (cr_data.get("check_runs") or []):
+                        if not isinstance(cr, dict):
+                            continue
+                        conc = str(cr.get("conclusion") or "").upper()
+                        d_url = str(cr.get("details_url") or "")
+                        if conc not in FAILURE_CONCLUSIONS or "flutter-dashboard.appspot.com" not in d_url:
+                            continue
+                        cr_name = str(cr.get("name") or "?")
+                        if cr_name == "Dashboard Checks" or "#/presubmit" in d_url:
+                            need_presubmit = True
+                            continue
+                        out_obj = cr.get("output") or {}
+                        body_txt = "\n\n".join(
+                            x.strip()
+                            for x in (out_obj.get("title") or "", out_obj.get("summary") or "", out_obj.get("text") or "")
+                            if isinstance(x, str) and x.strip()
+                        )
+                        print(f"# Check Run `{cr_name}` ({conc})\n{body_txt or '(no check-run output text)'}\n")
+                        printed_check_output = True
+                except json.JSONDecodeError:
+                    pass
+            if printed_check_output and not need_presubmit:
+                return 0
+
+        sys.stdout.write(
+            fetch_flutter_dashboard_presubmit_summary(
+                owner,
+                repo_name,
+                sha,
+                spool_dir,
+                max_lines=args.max_lines,
+            )
+        )
+        return 0
+
+    # Case 3: GitHub Actions run URL or numeric run_id
+    gh_m = re.search(r"(?:https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?/actions/runs/(\d+)", target)
+    raw_id_m = None if gh_m else re.match(r"^(\d+)$", target)
+    if gh_m or raw_id_m:
+        url_repo = gh_m.group(1) if gh_m else None
+        run_id = gh_m.group(2) if gh_m else raw_id_m.group(1)  # type: ignore[union-attr]
+        effective_repo = repo or url_repo
         cmd = ["run", "view", run_id, "--log-failed"]
-        if repo:
-            cmd.extend(["--repo", repo])
-        raw_log = run_gh(cmd, cwd=worktree)
+        if effective_repo:
+            cmd.extend(["--repo", effective_repo])
+        raw_log = run_gh(cmd, cwd=gh_cwd)
         log_file = spool_dir / f"gh_run_{run_id}.log"
         log_file.write_text(raw_log, encoding="utf-8")
         print(f"# GitHub Actions Run {run_id} (full failed log saved to {log_file})")
         print(extract_failure_windows(raw_log, max_lines=args.max_lines))
         return 0
 
+    # Case 4: GitHub CheckRun URL (`https://github.com/<owner>/<repo>/runs/<check_run_id>`)
+    cr_m = re.search(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/runs/(\d+)", target)
+    if cr_m:
+        cr_repo, cr_id = cr_m.group(1), cr_m.group(2)
+        cr_raw = run_gh(["api", f"repos/{cr_repo}/check-runs/{cr_id}"], cwd=gh_cwd)
+        cr_obj = json.loads(cr_raw)
+        details_url = str(cr_obj.get("details_url") or "").strip()
+        if details_url and details_url != target and (
+            parse_flutter_dashboard_url(details_url, default_repo=cr_repo) is not None
+            or re.search(r"(?:/b/|/b|/build/)(\d{15,})\b", details_url)
+        ):
+            delegated = argparse.Namespace(**vars(args))
+            delegated.target = details_url
+            delegated.repo = args.repo or cr_repo
+            return cmd_ci_log(delegated)
+        out_obj = cr_obj.get("output") or {}
+        text_parts = [
+            f"# GitHub Check Run `{cr_obj.get('name', cr_id)}` — conclusion: {cr_obj.get('conclusion', 'UNKNOWN')}",
+        ]
+        for field in ("title", "summary", "text"):
+            val = (out_obj.get(field) or "").strip()
+            if val:
+                text_parts.append(val)
+        print(extract_failure_windows("\n\n".join(text_parts), max_lines=args.max_lines))
+        return 0
+
     raise ToolError(
-        f"Unrecognized CI target '{target}'. Pass a GitHub Actions run ID/URL or LUCI detailsUrl."
+        f"Unrecognized CI target '{target}'. Pass a GitHub Actions run ID/URL, "
+        "Flutter Dashboard presubmit URL, or LUCI Buildbucket URL/ID."
     )
 
 
@@ -2023,8 +2623,10 @@ def cmd_outline(args: argparse.Namespace) -> int:
                 touched_lines.update(range(s, e + 1))
 
     if args.pr:
-        repo = normalize_repo_slug(args.repo, worktree)
-        spool_dir = resolve_spool_dir(repo, int(args.pr), Path(args.spool_root) if args.spool_root else None)
+        spool_root = Path(args.spool_root) if args.spool_root else None
+        pr_num = int(args.pr)
+        repo = normalize_repo_slug(args.repo, worktree, pr_number=pr_num, spool_root=spool_root)
+        spool_dir = resolve_spool_dir(repo, pr_num, spool_root)
         diff_patch = spool_dir / "diff.patch"
         if diff_patch.is_file():
             parsed_diff = parse_unified_diff(diff_patch.read_text(encoding="utf-8", errors="replace"))
@@ -2365,8 +2967,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
     raw_changed: int | None = None
 
     if args.pr:
-        repo = normalize_repo_slug(args.repo, worktree)
-        spool_dir = resolve_spool_dir(repo, int(args.pr), Path(args.spool_root) if args.spool_root else None)
+        spool_root = Path(args.spool_root) if args.spool_root else None
+        pr_num = int(args.pr)
+        repo = normalize_repo_slug(args.repo, worktree, pr_number=pr_num, spool_root=spool_root)
+        spool_dir = resolve_spool_dir(repo, pr_num, spool_root)
         diff_file = spool_dir / "diff.patch"
         if diff_file.is_file():
             parsed_diff = parse_unified_diff(diff_file.read_text(encoding="utf-8", errors="replace"))
@@ -2438,9 +3042,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_diff.add_argument("--list-chunks", action="store_true", help="List chunk manifest without printing diff lines.")
     sp_diff.set_defaults(func=cmd_diff)
 
-    sp_ci = sub.add_parser("ci-log", help="Extract bounded failure windows from GitHub Actions run ID/URL or LUCI detailsUrl.")
+    sp_ci = sub.add_parser(
+        "ci-log",
+        help="Extract bounded failure windows from GitHub Actions, Flutter Dashboard Presubmit, or LUCI Buildbucket.",
+    )
     add_common(sp_ci, require_pr=False)
-    sp_ci.add_argument("target", help="GitHub Actions run ID/URL or LUCI Buildbucket URL/ID.")
+    sp_ci.add_argument(
+        "target",
+        help="GitHub Actions run ID/URL, Flutter Dashboard presubmit URL, or LUCI Buildbucket URL/ID.",
+    )
     sp_ci.add_argument("--max-lines", type=int, default=120, help="Maximum output lines (default: 120).")
     sp_ci.set_defaults(func=cmd_ci_log)
 

@@ -723,5 +723,364 @@ class CliEndToEndTest(unittest.TestCase):
                 )
 
 
+class RemoteSessionAndLuciDashboardTest(unittest.TestCase):
+    def test_luci_get_build_valid_mask_and_log_priority_and_dedup(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        captured_requests: list[tuple[str, dict[str, object] | None]] = []
+
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._buf = io.BytesIO(body)
+
+            def read(self, n: int = -1) -> bytes:
+                return self._buf.read(n)
+
+            def __enter__(self) -> _FakeResp:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        def fake_urlopen(req_or_url: object, timeout: int = 30) -> _FakeResp:
+            if hasattr(req_or_url, "full_url"):
+                url = getattr(req_or_url, "full_url")
+                data_bytes = getattr(req_or_url, "data", None)
+                parsed_body = json.loads(data_bytes.decode("utf-8")) if data_bytes else None
+            else:
+                url = str(req_or_url)
+                parsed_body = None
+            captured_requests.append((url, parsed_body))
+
+            if url.endswith("/buildbucket.v2.Builds/GetBuild"):
+                # Enforce Buildbucket's repeated-field mask rule so `steps.name` would fail just like prod!
+                mask_fields = ((parsed_body or {}).get("mask") or {}).get("fields", "")  # type: ignore[union-attr]
+                if "steps." in str(mask_fields):
+                    raise AssertionError(f"Invalid Buildbucket repeated-field mask: {mask_fields}")
+                payload = ")]}'\n" + json.dumps({
+                    "id": "8665814997375925777",
+                    "builder": {
+                        "project": "flutter",
+                        "bucket": "try",
+                        "builder": "Windows framework_tests_libraries",
+                    },
+                    "status": "FAILURE",
+                    "summaryMarkdown": "Shared summary block: 1 test failed.",
+                    "steps": [
+                        {
+                            "name": "parent_wrapper",
+                            "status": "FAILURE",
+                        },
+                        {
+                            "name": "parent_wrapper|run framework_tests",
+                            "status": "FAILURE",
+                            "summaryMarkdown": "Shared summary block: 1 test failed.",
+                            "logs": [
+                                {
+                                    "name": "$execution details",
+                                    "viewUrl": "https://logs.chromium.org/logs/flutter/b/1/+/exec",
+                                },
+                                {
+                                    "name": "stderr",
+                                    "viewUrl": "https://logs.chromium.org/logs/flutter/b/1/+/stderr",
+                                },
+                                {
+                                    "name": "stdout",
+                                    "viewUrl": "https://logs.chromium.org/logs/flutter/b/1/+/stdout",
+                                },
+                            ],
+                        },
+                    ],
+                })
+                return _FakeResp(payload.encode("utf-8"))
+            if "stdout?format=raw" in url:
+                return _FakeResp(
+                    b"00:01 +10: passing\n"
+                    b"00:02 +10 -1: test/widgets/foo_test.dart: Foo regression [E]\n"
+                    b"  Expected: <42>\n"
+                    b"    Actual: <0>\n"
+                )
+            if "stderr?format=raw" in url:
+                return _FakeResp(b"minor warning without failure\n")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            empty_wt = Path(tmp) / "home_antigravity"
+            empty_wt.mkdir()
+            buf = io.StringIO()
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), redirect_stdout(buf):
+                rc = pr_tool.main([
+                    "ci-log",
+                    "--worktree",
+                    str(empty_wt),
+                    "--spool-root",
+                    str(spool),
+                    "https://ci.chromium.org/b/8665814997375925777",
+                ])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("# LUCI Build 8665814997375925777 (Windows framework_tests_libraries) — status: FAILURE", out)
+            self.assertIn("Foo regression [E]", out)
+            # Duplicate step summaryMarkdown identical to build summaryMarkdown must appear only once.
+            self.assertEqual(out.count("Shared summary block: 1 test failed."), 1)
+            # stdout must be prioritized ahead of alphabetically-earlier $execution details and stderr.
+            fetched_urls = [u for u, _ in captured_requests]
+            self.assertIn("https://logs.chromium.org/logs/flutter/b/1/+/stdout?format=raw", fetched_urls)
+            self.assertNotIn("https://logs.chromium.org/logs/flutter/b/1/+/stderr?format=raw", fetched_urls)
+
+    def test_flutter_dashboard_presubmit_url_and_searchbuilds_fallback(self) -> None:
+        import io
+        import urllib.error
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        dash_url = "https://flutter-dashboard.appspot.com/#/presubmit?repo=flutter&sha=202cddec515bb11706f87037dc65966490e9c35f"
+        parsed = pr_tool.parse_flutter_dashboard_url(dash_url)
+        self.assertEqual(
+            parsed,
+            {"owner": "flutter", "repo": "flutter", "sha": "202cddec515bb11706f87037dc65966490e9c35f"},
+        )
+        self.assertIsNone(pr_tool.parse_flutter_dashboard_url("https://ci.chromium.org/b/8665814997375925777"))
+
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._buf = io.BytesIO(body)
+
+            def read(self, n: int = -1) -> bytes:
+                return self._buf.read(n)
+
+            def __enter__(self) -> _FakeResp:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        # 1. Primary path via Cocoon get-presubmit-guard + get-presubmit-job (ignoring Neutral & Succeeded)
+        def cocoon_urlopen(req_or_url: object, timeout: int = 30) -> _FakeResp:
+            url = getattr(req_or_url, "full_url", str(req_or_url))
+            if "/api/public/get-presubmit-guard" in url:
+                return _FakeResp(json.dumps({
+                    "pr_num": 196159,
+                    "check_run_id": 128310221381,
+                    "stages": [
+                        {
+                            "name": "fusion",
+                            "jobs": {
+                                "Linux analyze": "Succeeded",
+                                "Mac tool_tests_general": "Neutral",
+                                "Linux_android_emu test": "In Progress",
+                                "Mac framework_tests_impeller": "Failed",
+                            },
+                        }
+                    ],
+                }).encode("utf-8"))
+            if "/api/public/get-presubmit-job" in url:
+                return _FakeResp(json.dumps([
+                    {"attempt_number": 1, "build_id": "8665811111111111111", "status": "Failed", "summary": "old attempt"},
+                    {"attempt_number": 2, "build_id": "8665822222222222222", "status": "Failed", "summary": "latest attempt"},
+                ]).encode("utf-8"))
+            if url.endswith("/buildbucket.v2.Builds/GetBuild"):
+                return _FakeResp((")]}'\n" + json.dumps({
+                    "id": "8665822222222222222",
+                    "builder": {"builder": "Mac framework_tests_impeller"},
+                    "status": "FAILURE",
+                    "steps": [
+                        {
+                            "name": "impeller_tests",
+                            "status": "FAILURE",
+                            "logs": [{"name": "stdout", "viewUrl": "https://logs.chromium.org/logs/flutter/b/2/+/stdout"}],
+                        }
+                    ],
+                })).encode("utf-8"))
+            if "stdout?format=raw" in url:
+                return _FakeResp(
+                    "══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞══\nImpeller assertion failed\n".encode("utf-8")
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool"
+            wt = Path(tmp) / "wt"
+            wt.mkdir()
+            buf = io.StringIO()
+            with mock.patch("urllib.request.urlopen", side_effect=cocoon_urlopen), redirect_stdout(buf):
+                rc = pr_tool.main([
+                    "ci-log", "--worktree", str(wt), "--spool-root", str(spool), dash_url,
+                ])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("1 failing job(s), 1 succeeded, 1 in progress, 1 neutral/skipped", out)
+            self.assertIn("`Mac framework_tests_impeller` (Failed, attempt 2/2) — https://ci.chromium.org/b/8665822222222222222", out)
+            self.assertNotIn("Mac tool_tests_general", out)
+            self.assertIn("Impeller assertion failed", out)
+
+        # 2. Fallback path via Buildbucket SearchBuilds when Cocoon guard fails (filtering retries & bringup)
+        def fallback_urlopen(req_or_url: object, timeout: int = 30) -> _FakeResp:
+            url = getattr(req_or_url, "full_url", str(req_or_url))
+            if "/api/public/get-presubmit-guard" in url:
+                raise urllib.error.URLError("dashboard temporarily unreachable")
+            if url.endswith("/buildbucket.v2.Builds/SearchBuilds"):
+                return _FakeResp((")]}'\n" + json.dumps({
+                    "builds": [
+                        # Retried flake: attempt 1 failed, attempt 2 succeeded -> must NOT be reported!
+                        {
+                            "id": "8665800000000000001",
+                            "builder": {"builder": "Linux flaky_shard"},
+                            "createTime": "2026-11-07T05:00:00Z",
+                            "status": "FAILURE",
+                        },
+                        {
+                            "id": "8665800000000000002",
+                            "builder": {"builder": "Linux flaky_shard"},
+                            "createTime": "2026-11-07T05:30:00Z",
+                            "status": "SUCCESS",
+                        },
+                        # Bringup target: must NOT be reported!
+                        {
+                            "id": "8665800000000000003",
+                            "builder": {"builder": "Linux experimental_bringup"},
+                            "createTime": "2026-11-07T05:30:00Z",
+                            "status": "FAILURE",
+                            "input": {"properties": {"bringup": True}},
+                        },
+                        # Real failing builder on latest attempt:
+                        {
+                            "id": "8665800000000000004",
+                            "builder": {"builder": "Linux framework_tests_misc"},
+                            "createTime": "2026-11-07T05:30:00Z",
+                            "status": "FAILURE",
+                            "summaryMarkdown": "Some tests failed.\nFailing tests:\n  test/widgets/ scrollable_test.dart",
+                        },
+                    ]
+                })).encode("utf-8"))
+            if url.endswith("/buildbucket.v2.Builds/GetBuild"):
+                return _FakeResp((")]}'\n" + json.dumps({
+                    "id": "8665800000000000004",
+                    "builder": {"builder": "Linux framework_tests_misc"},
+                    "status": "FAILURE",
+                    "summaryMarkdown": "Some tests failed.\nFailing tests:\n  test/widgets/scrollable_test.dart",
+                    "steps": [],
+                })).encode("utf-8"))
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool2"
+            wt = Path(tmp) / "wt2"
+            wt.mkdir()
+            buf = io.StringIO()
+            with mock.patch("urllib.request.urlopen", side_effect=fallback_urlopen), redirect_stdout(buf):
+                rc = pr_tool.main([
+                    "ci-log", "--worktree", str(wt), "--spool-root", str(spool), dash_url,
+                ])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("Linux framework_tests_misc", out)
+            self.assertIn("scrollable_test.dart", out)
+            self.assertNotIn("Linux flaky_shard", out)
+            self.assertNotIn("Linux experimental_bringup", out)
+
+    def test_preflight_fetches_pr_template_without_checkout_and_infers_repo_from_spool(self) -> None:
+        import io
+        import subprocess
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        remote_template = (
+            "## Pre-launch Checklist\n"
+            "- [ ] I read the [Contributor Guide] and followed the process.\n"
+            "- [ ] I listed at least one issue that this PR fixes.\n"
+            "- [ ] I added new tests to check the change.\n"
+        )
+
+        def fake_run_cmd(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            timeout: int = 120,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:3] == ["gh", "api", "user"]:
+                return subprocess.CompletedProcess(args, 0, stdout="remote-bot\n", stderr="")
+            if args[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps({
+                        "number": 777,
+                        "title": "Fix widget",
+                        "body": "Fixes nothing\n\n## Pre-launch Checklist\n- [x] I read the [Contributor Guide] and followed the process.\n",
+                        "author": {"login": "alice"},
+                        "labels": [],
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "headRefOid": "cafebabe1234",
+                        "baseRefName": "master",
+                        "files": [{"path": "packages/flutter/lib/src/widgets/foo.dart"}],
+                        "statusCheckRollup": [{"name": "cla/google", "conclusion": "SUCCESS"}],
+                        "url": "https://github.com/flutter/flutter/pull/777",
+                    }),
+                    stderr="",
+                )
+            if args[:3] == ["gh", "pr", "diff"]:
+                return subprocess.CompletedProcess(args, 0, stdout=SAMPLE_DIFF, stderr="")
+            if len(args) >= 3 and args[:2] == ["gh", "api"] and "PULL_REQUEST_TEMPLATE.md" in args[2]:
+                return subprocess.CompletedProcess(args, 0, stdout=remote_template, stderr="")
+            if args[:3] == ["gh", "api", "graphql"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps({"data": {"repository": {"pullRequest": {"reviews": {"nodes": []}, "comments": {"nodes": []}, "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}}}}}),
+                    stderr="",
+                )
+            if args[:3] == ["gh", "repo", "view"]:
+                # Simulate `/home/antigravity` outside any git repository!
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="not a git repository")
+            raise AssertionError(f"Unexpected subprocess call: {args}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_home = Path(tmp) / "home_antigravity"
+            empty_home.mkdir()
+            spool_root = Path(tmp) / "spool"
+
+            buf = io.StringIO()
+            with mock.patch.object(pr_tool, "run_cmd", side_effect=fake_run_cmd), redirect_stdout(buf):
+                rc = pr_tool.main([
+                    "preflight",
+                    "--pr",
+                    "777",
+                    "--repo",
+                    "flutter/flutter",
+                    "--worktree",
+                    str(empty_home),
+                    "--spool-root",
+                    str(spool_root),
+                ])
+            self.assertEqual(rc, 0)
+            state = json.loads(buf.getvalue())
+            g3 = state["gates"]["gate3_process_ai"]
+            self.assertEqual(g3["template_source"], "gh_api")
+            self.assertEqual(g3["template_checkbox_count"], 3)
+            self.assertEqual(len(g3["missing_template_items"]), 2)
+
+            # Subsequent commands (`diff`, `validate`) without `--repo` in `/home/antigravity`
+            # must infer `flutter/flutter` automatically from `spool_root`!
+            buf_diff = io.StringIO()
+            with mock.patch.object(pr_tool, "run_cmd", side_effect=fake_run_cmd), redirect_stdout(buf_diff):
+                rc_diff = pr_tool.main([
+                    "diff",
+                    "--pr",
+                    "777",
+                    "--worktree",
+                    str(empty_home),
+                    "--spool-root",
+                    str(spool_root),
+                ])
+            self.assertEqual(rc_diff, 0)
+            self.assertIn("[R   12]", buf_diff.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
